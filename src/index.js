@@ -59,6 +59,8 @@ const DEFAULT_CONFIG = {
     channelId: null,
     messageId: null,
   },
+  ticketCategoryId: null,
+  transcriptChannelId: null,
 };
 const recentActions = new Map();
 const protectedExecutors = new Set();
@@ -92,6 +94,8 @@ function getConfig(guildId) {
       ...DEFAULT_CONFIG.ticketPanel,
       ...(saved.ticketPanel || {}),
     },
+    ticketCategoryId: saved.ticketCategoryId || null,
+    transcriptChannelId: saved.transcriptChannelId || null,
     whitelist: Array.isArray(saved.whitelist) ? saved.whitelist : [],
     antinukeLogs: Array.isArray(saved.antinukeLogs) ? saved.antinukeLogs : [],
     autoresponders: Array.isArray(saved.autoresponders) ? saved.autoresponders : [],
@@ -629,6 +633,16 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addChannelOption((option) => option.setName('channel').setDescription('Channel to post the ticket panel').addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]).setRequired(false)),
   new SlashCommandBuilder()
+    .setName('ticketcategory')
+    .setDescription('Set the category where new ticket channels will be created')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption((option) => option.setName('category').setDescription('Ticket category').addChannelTypes([ChannelType.GuildCategory]).setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('tickettranscript')
+    .setDescription('Set the channel where ticket transcripts are posted')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption((option) => option.setName('channel').setDescription('Text channel for transcripts').addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]).setRequired(false)),
+  new SlashCommandBuilder()
     .setName('afk')
     .setDescription('Set your nickname to [AFK] username and mark yourself as AFK')
     .addStringOption((option) => option.setName('reason').setDescription('Optional AFK reason').setRequired(false)),
@@ -737,6 +751,29 @@ function buildTicketPanelComponents() {
   );
 }
 
+async function sendTicketTranscript(guild, channel) {
+  const config = getConfig(guild.id);
+  if (!config.transcriptChannelId) return;
+
+  const transcriptChannel = guild.channels.cache.get(config.transcriptChannelId) || await guild.channels.fetch(config.transcriptChannelId).catch(() => null);
+  if (!transcriptChannel || !transcriptChannel.isTextBased?.()) return;
+
+  const messages = await channel.messages.fetch({ limit: 100 }).catch(() => new Map());
+  const transcript = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp).map((message) => {
+    const content = (message.content || '[embed/attachment]').replace(/\r\n/g, '\n');
+    const attachments = message.attachments.size ? ` | attachments: ${message.attachments.map((attachment) => attachment.url).join(', ')}` : '';
+    return `[${new Date(message.createdTimestamp).toISOString()}] ${message.author.tag}: ${content}${attachments}`;
+  }).join('\n');
+
+  const payload = `Ticket transcript for ${channel.name}\n\n${transcript || 'No messages were sent in this ticket.'}`;
+  const chunks = payload.match(/.{1,1800}/gs) || ['No transcript available.'];
+
+  await transcriptChannel.send({ content: `Transcript for ${channel}:` });
+  for (const chunk of chunks) {
+    await transcriptChannel.send({ content: `\`\`\`\n${chunk}\n\`\`\`` });
+  }
+}
+
 async function createTicketChannel(guild, user, type) {
   const config = getConfig(guild.id);
   const staffRoleIds = [
@@ -750,7 +787,7 @@ async function createTicketChannel(guild, user, type) {
   const channel = await guild.channels.create({
     name: channelName,
     type: ChannelType.GuildText,
-    parent: guild.channels.cache.find((candidate) => candidate.type === ChannelType.GuildCategory && candidate.name.toLowerCase().includes('ticket'))?.id || undefined,
+    parent: config.ticketCategoryId || guild.channels.cache.find((candidate) => candidate.type === ChannelType.GuildCategory && candidate.name.toLowerCase().includes('ticket'))?.id || undefined,
     permissionOverwrites: [
       { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
       { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
@@ -866,6 +903,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    await sendTicketTranscript(interaction.guild, channel);
     await channel.delete('Ticket closed by staff member').catch(async () => {
       await interaction.reply({ content: 'I could not close that ticket. Please check my permissions.', ephemeral: true });
     });
@@ -1150,6 +1188,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await setupTicketPanel(interaction.guild, targetChannel);
     await interaction.reply({ content: `Ticket panel created in ${targetChannel}.`, ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'ticketcategory') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const config = getConfig(interaction.guildId);
+    const category = interaction.options.getChannel('category', false);
+    config.ticketCategoryId = category ? category.id : null;
+    saveConfig(interaction.guildId, config);
+    await interaction.reply({ content: category ? `New tickets will be created in ${category}.` : 'Ticket category cleared.', ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'tickettranscript') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const config = getConfig(interaction.guildId);
+    const channel = interaction.options.getChannel('channel', false);
+    config.transcriptChannelId = channel ? channel.id : null;
+    saveConfig(interaction.guildId, config);
+    await interaction.reply({ content: channel ? `Ticket transcripts will be sent to ${channel}.` : 'Transcript channel cleared.', ephemeral: true });
     return;
   }
 
