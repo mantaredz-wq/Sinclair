@@ -40,6 +40,7 @@ const DEFAULT_CONFIG = {
   adminRoleId: null,
   psmRoleId: null,
   whitelist: [],
+  whitelistRoles: [],
   antinukeLogs: [],
   autoresponders: [],
   economy: {
@@ -97,6 +98,7 @@ function getConfig(guildId) {
     ticketCategoryId: saved.ticketCategoryId || null,
     transcriptChannelId: saved.transcriptChannelId || null,
     whitelist: Array.isArray(saved.whitelist) ? saved.whitelist : [],
+    whitelistRoles: Array.isArray(saved.whitelistRoles) ? saved.whitelistRoles : [],
     antinukeLogs: Array.isArray(saved.antinukeLogs) ? saved.antinukeLogs : [],
     autoresponders: Array.isArray(saved.autoresponders) ? saved.autoresponders : [],
     economy: {
@@ -183,7 +185,8 @@ async function handleExternalInviteLink(message) {
   if (!config.enabled || message.author.bot || !message.guild) return;
 
   const member = await message.guild.members.fetch(message.author.id).catch(() => null);
-  if (message.author.id === message.guild.ownerId || config.whitelist.includes(message.author.id) || hasProtectedRole(message.guild, member, config)) return;
+  const roleWhitelisted = member ? config.whitelistRoles.some((roleId) => member.roles.cache.has(roleId)) : false;
+  if (message.author.id === message.guild.ownerId || config.whitelist.includes(message.author.id) || roleWhitelisted || hasProtectedRole(message.guild, member, config)) return;
 
   const inviteCodes = extractDiscordInviteCodes(message.content);
   if (!inviteCodes.length) return;
@@ -570,6 +573,17 @@ const commands = [
     .addStringOption((option) => option.setName('user').setDescription('User mention or ID').setRequired(true))
     .addStringOption((option) => option.setName('role').setDescription('Role name, mention, or ID').setRequired(true)),
   new SlashCommandBuilder()
+    .setName('whitelist')
+    .setDescription('Manage protected users and roles for anti-nuke checks')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand((command) => command
+      .setName('role')
+      .setDescription('Add or remove a role from the whitelist')
+      .addRoleOption((option) => option.setName('role').setDescription('Role to whitelist').setRequired(true)))
+    .addSubcommand((command) => command
+      .setName('list')
+      .setDescription('List whitelisted users and roles')),
+  new SlashCommandBuilder()
     .setName('autoresponder')
     .setDescription('Manage automatic keyword replies')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -751,27 +765,33 @@ function buildTicketPanelComponents() {
   );
 }
 
-async function sendTicketTranscript(guild, channel) {
+async function sendTicketTranscript(guild, channel, closerUser) {
   const config = getConfig(guild.id);
   if (!config.transcriptChannelId) return;
 
   const transcriptChannel = guild.channels.cache.get(config.transcriptChannelId) || await guild.channels.fetch(config.transcriptChannelId).catch(() => null);
   if (!transcriptChannel || !transcriptChannel.isTextBased?.()) return;
 
-  const messages = await channel.messages.fetch({ limit: 100 }).catch(() => new Map());
-  const transcript = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp).map((message) => {
-    const content = (message.content || '[embed/attachment]').replace(/\r\n/g, '\n');
-    const attachments = message.attachments.size ? ` | attachments: ${message.attachments.map((attachment) => attachment.url).join(', ')}` : '';
-    return `[${new Date(message.createdTimestamp).toISOString()}] ${message.author.tag}: ${content}${attachments}`;
-  }).join('\n');
+  const ownerMatch = String(channel.topic || '').match(/ticket-owner:(\d+)/);
+  const ticketOwnerId = ownerMatch ? ownerMatch[1] : null;
+  const openTimestamp = Math.floor(channel.createdAt.getTime() / 1000);
+  const closeTimestamp = Math.floor(Date.now() / 1000);
 
-  const payload = `Ticket transcript for ${channel.name}\n\n${transcript || 'No messages were sent in this ticket.'}`;
-  const chunks = payload.match(/.{1,1800}/gs) || ['No transcript available.'];
+  const messageAsEmbed = new EmbedBuilder()
+    .setTitle('Ticket Closed')
+    .setColor(0x2f3136)
+    .addFields(
+      { name: 'Ticket ID', value: `\`${channel.id}\``, inline: true },
+      { name: 'Opened By', value: ticketOwnerId ? `<@${ticketOwnerId}>` : 'Unknown', inline: true },
+      { name: 'Closed By', value: closerUser ? `<@${closerUser.id}>` : 'Unknown', inline: true },
+      { name: 'Open Time', value: `<t:${openTimestamp}:f>`, inline: true },
+      { name: 'Closed Time', value: `<t:${closeTimestamp}:f>`, inline: true },
+      { name: 'Claimed By', value: 'Unclaimed', inline: true },
+      { name: 'Reason', value: 'No reason provided', inline: true },
+    )
+    .setFooter({ text: `Ticket: ${channel.name}` });
 
-  await transcriptChannel.send({ content: `Transcript for ${channel}:` });
-  for (const chunk of chunks) {
-    await transcriptChannel.send({ content: `\`\`\`\n${chunk}\n\`\`\`` });
-  }
+  await transcriptChannel.send({ embeds: [messageAsEmbed] });
 }
 
 async function createTicketChannel(guild, user, type) {
@@ -903,7 +923,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    await sendTicketTranscript(interaction.guild, channel);
+    await sendTicketTranscript(interaction.guild, channel, interaction.user);
     await channel.delete('Ticket closed by staff member').catch(async () => {
       await interaction.reply({ content: 'I could not close that ticket. Please check my permissions.', ephemeral: true });
     });
@@ -1396,6 +1416,50 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (interaction.commandName === 'whitelist') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const config = getConfig(interaction.guildId);
+    const subcommand = interaction.options.getSubcommand();
+
+    if (subcommand === 'role') {
+      const role = interaction.options.getRole('role', true);
+      const existed = config.whitelistRoles.includes(role.id);
+      config.whitelistRoles = existed
+        ? config.whitelistRoles.filter((value) => value !== role.id)
+        : [...new Set([...config.whitelistRoles, role.id])];
+      saveConfig(interaction.guildId, config);
+      await interaction.reply({ content: existed ? `Removed ${role} from the whitelist.` : `Added ${role} to the whitelist.`, ephemeral: true });
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle('Whitelist')
+      .setColor(0x5865f2)
+      .addFields(
+        {
+          name: 'Users',
+          value: config.whitelist.length ? config.whitelist.map((id) => `<@${id}>`).join(', ') : 'None',
+          inline: false,
+        },
+        {
+          name: 'Roles',
+          value: config.whitelistRoles.length ? config.whitelistRoles.map((id) => `<@&${id}>`).join(', ') : 'None',
+          inline: false,
+        },
+      );
+
+    await interaction.reply({ embeds: [embed], ephemeral: true });
+    return;
+  }
+
   if (interaction.commandName === 'autoresponder') {
     if (!interaction.guild) {
       await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
@@ -1747,7 +1811,8 @@ async function handleDestructiveAction(guild, auditType, targetId, label) {
   if (!executor || executor.id === client.user.id) return;
 
   const member = await guild.members.fetch(executor.id).catch(() => null);
-  if (executor.id === guild.ownerId || config.whitelist.includes(executor.id) || hasProtectedRole(guild, member, config)) return;
+  const roleWhitelisted = member ? config.whitelistRoles.some((roleId) => member.roles.cache.has(roleId)) : false;
+  if (executor.id === guild.ownerId || config.whitelist.includes(executor.id) || roleWhitelisted || hasProtectedRole(guild, member, config)) return;
 
   const now = Date.now();
   const key = `${guild.id}:${executor.id}`;
