@@ -13,10 +13,13 @@ const {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  ModalBuilder,
   PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 
 const { DISCORD_TOKEN, CLIENT_ID, DISCORD_GUILD_ID } = process.env;
@@ -52,6 +55,10 @@ const DEFAULT_CONFIG = {
     createChannelId: null,
     roomName: "{user}'s room",
   },
+  ticketPanel: {
+    channelId: null,
+    messageId: null,
+  },
 };
 const recentActions = new Map();
 const protectedExecutors = new Set();
@@ -80,6 +87,10 @@ function getConfig(guildId) {
     tempVoice: {
       ...DEFAULT_CONFIG.tempVoice,
       ...(saved.tempVoice || {}),
+    },
+    ticketPanel: {
+      ...DEFAULT_CONFIG.ticketPanel,
+      ...(saved.ticketPanel || {}),
     },
     whitelist: Array.isArray(saved.whitelist) ? saved.whitelist : [],
     antinukeLogs: Array.isArray(saved.antinukeLogs) ? saved.antinukeLogs : [],
@@ -132,6 +143,20 @@ function hasProtectedRole(guild, member, config) {
   ].filter(Boolean);
 
   return protectedRoleIds.some((roleId) => member.roles.cache.has(roleId));
+}
+
+function hasTicketStaffRole(guild, member, config) {
+  if (!guild || !member) return false;
+  if (member.id === guild.ownerId) return true;
+
+  const staffRoleIds = [
+    config.ownerRoleId,
+    config.coOwnerRoleId,
+    config.adminRoleId,
+    config.psmRoleId,
+  ].filter(Boolean);
+
+  return staffRoleIds.some((roleId) => member.roles.cache.has(roleId));
 }
 
 function extractDiscordInviteCodes(text) {
@@ -599,6 +624,11 @@ const commands = [
       .addUserOption((option) => option.setName('user').setDescription('Opponent to challenge').setRequired(true))
       .addIntegerOption((option) => option.setName('amount').setDescription('Coins to bet (500-2000)').setMinValue(500).setMaxValue(2000).setRequired(true))),
   new SlashCommandBuilder()
+    .setName('tsetup')
+    .setDescription('Create a ticket panel with Tryout, Scrim, and Partnership buttons')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption((option) => option.setName('channel').setDescription('Channel to post the ticket panel').addChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]).setRequired(false)),
+  new SlashCommandBuilder()
     .setName('afk')
     .setDescription('Set your nickname to [AFK] username and mark yourself as AFK')
     .addStringOption((option) => option.setName('reason').setDescription('Optional AFK reason').setRequired(false)),
@@ -699,6 +729,68 @@ function buildWelcomeEmbed(guild, user, embedConfig) {
   };
 }
 
+function buildTicketPanelComponents() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ticket:tryout').setLabel('Tryout').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ticket:scrim').setLabel('Scrim').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ticket:partnership').setLabel('Partnership').setStyle(ButtonStyle.Secondary),
+  );
+}
+
+async function createTicketChannel(guild, user, type) {
+  const config = getConfig(guild.id);
+  const staffRoleIds = [
+    config.ownerRoleId,
+    config.coOwnerRoleId,
+    config.adminRoleId,
+    config.psmRoleId,
+  ].filter(Boolean);
+
+  const channelName = `${type}-${user.username}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').slice(0, 80);
+  const channel = await guild.channels.create({
+    name: channelName,
+    type: ChannelType.GuildText,
+    parent: guild.channels.cache.find((candidate) => candidate.type === ChannelType.GuildCategory && candidate.name.toLowerCase().includes('ticket'))?.id || undefined,
+    permissionOverwrites: [
+      { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+      ...staffRoleIds.map((roleId) => ({
+        id: roleId,
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
+      })),
+    ],
+    topic: `ticket-owner:${user.id}`,
+  });
+
+  const closeButton = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ticket:close:${channel.id}`).setLabel('Close Ticket').setStyle(ButtonStyle.Danger),
+  );
+
+  await channel.send({
+    content: `Ticket opened by ${user}. Staff can reply here and close this ticket.`,
+    components: [closeButton],
+    allowedMentions: { parse: ['users'] },
+  });
+
+  return channel;
+}
+
+async function setupTicketPanel(guild, channel) {
+  const message = await channel.send({
+    components: [buildTicketPanelComponents()],
+    allowedMentions: { parse: [] },
+  });
+
+  const config = getConfig(guild.id);
+  config.ticketPanel = {
+    channelId: channel.id,
+    messageId: message.id,
+  };
+  saveConfig(guild.id, config);
+
+  return message;
+}
+
 function makeTempVoiceControls(channel, owner) {
   const controls = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`tempvoice:lock:${channel.id}`).setLabel('Lock').setStyle(ButtonStyle.Secondary),
@@ -746,6 +838,129 @@ client.once(Events.ClientReady, (readyClient) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isButton() && interaction.customId.startsWith('ticket:close:')) {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'Tickets can only be closed in a server.', ephemeral: true });
+      return;
+    }
+
+    const channelId = interaction.customId.split(':')[2];
+    const channel = interaction.guild.channels.cache.get(channelId) || await interaction.guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      await interaction.reply({ content: 'That ticket channel no longer exists.', ephemeral: true });
+      return;
+    }
+
+    const config = getConfig(interaction.guild.id);
+    const member = interaction.member;
+    const ownerMatch = String(channel.topic || '').match(/ticket-owner:(\d+)/);
+    const ticketOwnerId = ownerMatch ? ownerMatch[1] : null;
+
+    if (interaction.user.id === ticketOwnerId) {
+      await interaction.reply({ content: 'You cannot close your own ticket.', ephemeral: true });
+      return;
+    }
+
+    if (!hasTicketStaffRole(interaction.guild, member, config)) {
+      await interaction.reply({ content: 'Only the configured owner/coowner/admin/PSM roles can close a ticket.', ephemeral: true });
+      return;
+    }
+
+    await channel.delete('Ticket closed by staff member').catch(async () => {
+      await interaction.reply({ content: 'I could not close that ticket. Please check my permissions.', ephemeral: true });
+    });
+
+    await interaction.reply({ content: 'Ticket closed.', ephemeral: true });
+    return;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('ticket-modal:')) {
+    const [, type] = interaction.customId.split(':');
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'Ticket creation only works in a server.', ephemeral: true });
+      return;
+    }
+
+    try {
+      const createdChannel = await createTicketChannel(interaction.guild, interaction.user, type);
+      const robloxUsername = interaction.fields.getTextInputValue('robloxUsername');
+      const joinOrReferral = interaction.fields.getTextInputValue('joinOrReferral');
+      const device = interaction.fields.getTextInputValue('device');
+
+      await createdChannel.send({
+        content: [
+          `Tryout ticket opened by ${interaction.user}.`,
+          '',
+          `Roblox Username: ${robloxUsername}`,
+          `Join or Referral: ${joinOrReferral}`,
+          `Device: ${device}`,
+        ].join('\n'),
+        allowedMentions: { parse: ['users'] },
+      });
+
+      await interaction.reply({ content: `Your Tryout ticket has been created: ${createdChannel}.`, ephemeral: true });
+    } catch (error) {
+      console.error(`Could not create Tryout ticket for ${interaction.user.id}:`, error.message);
+      await interaction.reply({ content: 'I could not create that ticket channel. Please check my permissions.', ephemeral: true });
+    }
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith('ticket:')) {
+    const [, type] = interaction.customId.split(':');
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'Ticket creation only works in a server.', ephemeral: true });
+      return;
+    }
+
+    if (type === 'tryout') {
+      const modal = new ModalBuilder()
+        .setCustomId(`ticket-modal:${type}`)
+        .setTitle('Tryout Form');
+
+      const robloxUsername = new TextInputBuilder()
+        .setCustomId('robloxUsername')
+        .setLabel('Roblox Username')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      const joinOrReferral = new TextInputBuilder()
+        .setCustomId('joinOrReferral')
+        .setLabel('Join or Referral')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      const device = new TextInputBuilder()
+        .setCustomId('device')
+        .setLabel('Device Cp or PC?')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(robloxUsername),
+        new ActionRowBuilder().addComponents(joinOrReferral),
+        new ActionRowBuilder().addComponents(device),
+      );
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    const label = type.charAt(0).toUpperCase() + type.slice(1);
+    try {
+      const createdChannel = await createTicketChannel(interaction.guild, interaction.user, type);
+      await createdChannel.send({
+        content: `Thanks for opening a ${label} ticket, ${interaction.user}! A staff member will assist you shortly.`,
+        allowedMentions: { parse: ['users'] },
+      });
+      await interaction.reply({ content: `Your ${label} ticket has been created: ${createdChannel}.`, ephemeral: true });
+    } catch (error) {
+      console.error(`Could not create ticket channel for ${interaction.user.id}:`, error.message);
+      await interaction.reply({ content: 'I could not create that ticket channel. Please check my permissions.', ephemeral: true });
+    }
+    return;
+  }
+
   if (interaction.isButton() && interaction.customId.startsWith('mines:')) {
     try {
       await handleMinesButton(interaction);
@@ -914,6 +1129,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
     config.autoRoleId = role ? role.id : null;
     saveConfig(interaction.guildId, config);
     await interaction.reply({ content: role ? `Auto-role set to ${role.name}.` : 'Auto-role cleared.', ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'tsetup') {
+    if (!interaction.guild) {
+      await interaction.reply({ content: 'This command can only be used in a server.', ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      await interaction.reply({ content: 'Administrator permission is required.', ephemeral: true });
+      return;
+    }
+
+    const targetChannel = interaction.options.getChannel('channel', false) || interaction.channel;
+    if (!targetChannel || !targetChannel.isTextBased?.()) {
+      await interaction.reply({ content: 'Please pick a valid text channel for the ticket panel.', ephemeral: true });
+      return;
+    }
+
+    await setupTicketPanel(interaction.guild, targetChannel);
+    await interaction.reply({ content: `Ticket panel created in ${targetChannel}.`, ephemeral: true });
     return;
   }
 
